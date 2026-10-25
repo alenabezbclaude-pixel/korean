@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="한국어">
 <style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}[hidden]{display:none!important}</style>
-<title>Корейский с Алёной</title>
+<title>Корейский · liyelya</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
@@ -569,6 +569,7 @@ select,input[type=text]{border-radius:10px;background:var(--surface)}
 
   <footer>
     <span class="sync" id="sync" data-s="local"><i></i><span id="syncText">Прогресс хранится в этом браузере</span></span>
+    <span id="authBox" hidden><button class="btn-main" id="authBtn" type="button">Войти через Google</button></span>
     <span><button class="link" id="reset">Сбросить прогресс урока</button> <span id="resetConfirm" hidden> — точно? <button class="link" id="resetYes">Да, сбросить</button> · <button class="link" id="resetNo">Отмена</button></span></span>
   </footer>
 </div>
@@ -1994,7 +1995,8 @@ const SYNC_TEXT = {
   connecting: "Подключаюсь к облаку…",
   saving: "Сохраняю…",
   saved: "Прогресс сохранён в облаке и одинаков на всех ваших устройствах",
-  error: "Нет связи с облаком. Прогресс сохранён в этом браузере и отправится позже."
+  error: "Нет связи с облаком. Прогресс сохранён в этом браузере и отправится позже.",
+  signin: "Войдите через Google, чтобы прогресс был одинаковым на ноутбуке и телефоне."
 };
 function setSync(s){ $("#sync").dataset.s = s; $("#syncText").textContent = SYNC_TEXT[s]; }
 function queueRemote(){ if (!remoteRef) return; dirty = true; setSync("saving"); clearTimeout(saveTimer); saveTimer = setTimeout(flush, 1200); }
@@ -2019,8 +2021,72 @@ if (store.prefs.rate == null) store.prefs.rate = store.prefs.slow ? 0.6 : 0.9;
   saveLocal(); syncPrefsUI(); updateStats();
   if (view === "home") renderHome();
 }
+/* Firebase: используется, когда сайт открыт не в Claude (например, на GitHub Pages) */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyD1llAdz2SbBw7EJkBikhoVLlL4guLtxwI",
+  authDomain: "korean-d2264.firebaseapp.com",
+  projectId: "korean-d2264",
+  storageBucket: "korean-d2264.firebasestorage.app",
+  messagingSenderId: "273683946687",
+  appId: "1:273683946687:web:2541d4b6fe28f7128f7a0a"
+};
+function mergeStores(a, b){
+  const out = JSON.parse(JSON.stringify(b)); out.lessons = out.lessons || {};
+  for (const [id, la] of Object.entries(a.lessons || {})){
+    const lb = out.lessons[id] = out.lessons[id] || {box:{}, seen:{}, best:null};
+    lb.box = lb.box || {}; lb.seen = lb.seen || {};
+    for (const [w, v] of Object.entries(la.box || {})) lb.box[w] = Math.max(lb.box[w] || 0, v || 0);
+    for (const w of Object.keys(la.seen || {})) lb.seen[w] = true;
+    if (la.best != null) lb.best = Math.max(lb.best == null ? 0 : lb.best, la.best);
+    if (la.notesDone) lb.notesDone = true;
+    if (la.tasks) lb.tasks = Object.assign({}, lb.tasks || {}, la.tasks);
+  }
+  out.read = Object.assign({}, a.read || {}, out.read || {});
+  out.days = Object.assign({}, a.days || {}, out.days || {});
+  out.prefs = Object.assign({}, a.prefs || {}, out.prefs || {});
+  out.updatedAt = Date.now();
+  return out;
+}
+function loadScript(src){ return new Promise((res, rej)=>{ const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+async function connectFirebase(){
+  setSync("connecting");
+  const V = "10.12.2", base = `https://www.gstatic.com/firebasejs/${V}/`;
+  try {
+    await loadScript(base + "firebase-app-compat.js");
+    await Promise.all([loadScript(base + "firebase-auth-compat.js"), loadScript(base + "firebase-firestore-compat.js")]);
+  } catch(e){ setSync("local"); return; }
+  firebase.initializeApp(FIREBASE_CONFIG);
+  const auth = firebase.auth(), fdb = firebase.firestore();
+  try { await auth.getRedirectResult(); } catch(e){}
+  const box = $("#authBox"), btn = $("#authBtn");
+  btn.addEventListener("click", async ()=>{
+    if (auth.currentUser){ await auth.signOut(); return; }
+    const prov = new firebase.auth.GoogleAuthProvider();
+    try { await auth.signInWithPopup(prov); }
+    catch(e){ if (e && (e.code === "auth/popup-blocked" || e.code === "auth/operation-not-supported-in-this-environment")) auth.signInWithRedirect(prov); else { setSync("error"); $("#syncText").textContent = "Не получилось войти: " + (e && e.message || e); } }
+  });
+  let unsub = null;
+  auth.onAuthStateChanged(user => {
+    box.hidden = false;
+    if (unsub){ unsub(); unsub = null; } remoteRef = null;
+    if (!user){ btn.textContent = "Войти через Google"; btn.className = "btn-main"; setSync("signin"); return; }
+    btn.textContent = "Выйти (" + (user.email || "аккаунт") + ")"; btn.className = "link";
+    const ref = fdb.collection("users").doc(user.uid);
+    let first = true;
+    unsub = ref.onSnapshot(snap => {
+      const r = snap.exists ? snap.data() : null;
+      if (first){
+        first = false; remoteRef = ref;
+        if (r && r.lessons){ const merged = mergeStores(store, r); applyRemote(merged); }
+        if (hasProgress()){ dirty = true; flush(); } else setSync("saved");
+        return;
+      }
+      if (r && !snap.metadata.hasPendingWrites && (r.updatedAt||0) > (store.updatedAt||0)) applyRemote(r);
+    }, () => setSync("error"));
+  });
+}
 async function connect(){
-  if (!window.claude || typeof window.claude.use !== "function"){ setSync("local"); return; }
+  if (!window.claude || typeof window.claude.use !== "function"){ if (FIREBASE_CONFIG) connectFirebase(); else setSync("local"); return; }
   setSync("connecting");
   try {
     const [db, user] = await Promise.all([claude.use("db"), claude.use("user")]);
